@@ -25,6 +25,14 @@ MONEY_QUANT = Decimal("0.01")
 # 满量翻转判定：上一条读数需达到满量的这个比例，否则按倒走隔离
 ROLLOVER_MIN_RATIO = Decimal("0.9")
 
+# 跨站复核：只比较两站都有实测的日期（零雨也是实测），未共同覆盖的日子不计。
+# 共同实测日上分别求和：绝对差 ≤ 10.0 mm 或相对差 ≤ 20% 判「一致」，
+# 两项都超过才判「提示巡查」；两站某月无共同实测日判「证据不足」。
+CROSS_REVIEW_RULE_VERSION = "cross-review/1.0.0"
+CROSS_REVIEW_ABS_TOLERANCE_MM = Decimal("10.0")
+CROSS_REVIEW_REL_TOLERANCE = Decimal("0.20")
+CROSS_REVIEW_RAIN_QUANT = Decimal("0.1")
+
 REGISTERS = ("TOTAL", "PEAK", "FLAT", "VALLEY")
 REGISTER_LABELS = {"TOTAL": "总", "PEAK": "峰", "FLAT": "平", "VALLEY": "谷"}
 TOU_REGISTERS = ("PEAK", "FLAT", "VALLEY")
@@ -84,6 +92,7 @@ SAMPLES = {
 DEFAULT_SAMPLE = "readings_dirty.csv"
 METERS_FILE = "meters.csv"
 PRICES_FILE = "prices.csv"
+STATION_DAILY_FILE = "station_daily.csv"
 
 # 单一制电价兜底（prices.csv 缺失时）
 DEFAULT_PRICES = {"TOTAL": Decimal("0.65"), "PEAK": Decimal("1.05"),

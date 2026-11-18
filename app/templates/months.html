@@ -1,35 +1,130 @@
 {% extends "base.html" %}
 {% block body %}
 <section class="page-head">
-  <div><h1 class="page-title">月合计</h1><p class="page-meta mono">2024-02 · 当地自然日</p></div>
-  <div class="actions"><a class="btn btn-primary" href="/api/export/monthly.csv">导出月报</a></div>
+  <div><h1 class="page-title">月合计</h1><p class="page-meta mono">按当地自然日 · 零雨算实测 · 缺测不参与比较</p></div>
+  <div class="actions">
+    <button class="btn btn-primary" id="review-button" type="button">按当前日值重新复核</button>
+    <a class="btn btn-ghost" href="/api/export/monthly.csv">导出月报</a>
+  </div>
 </section>
 
-{% if not batch %}
-<section class="empty"><p class="empty-line">先运行日值样例。</p></section>
-{% else %}
+<div class="notice" id="notice" role="status" hidden></div>
 
 <section class="kpis" aria-label="月报合计">
   <div class="kpi"><span class="kpi-label">输入日值</span><span class="kpi-value mono">{{ hydro_accounts.source }}</span></div>
   <div class="kpi"><span class="kpi-label">采纳</span><span class="kpi-value mono">{{ hydro_accounts.accepted }}</span></div>
   <div class="kpi"><span class="kpi-label">重复版本</span><span class="kpi-value mono">{{ hydro_accounts.duplicates }}</span></div>
-  <div class="kpi"><span class="kpi-label">差额</span><span class="kpi-value mono">{{ hydro_accounts.delta }}</span></div>
+  <div class="kpi"><span class="kpi-label">站点</span><span class="kpi-value mono">{{ review.summary.station_count }}</span></div>
+  <div class="kpi"><span class="kpi-label">提示巡查</span><span class="kpi-value mono">{{ review.summary.divergent }}</span></div>
+  <div class="kpi"><span class="kpi-label">证据不足</span><span class="kpi-value mono">{{ review.summary.insufficient }}</span></div>
 </section>
 
-<section class="panel">
-  <div class="panel-head"><h2 class="panel-title">站点月报</h2><span class="panel-sub mono">闰年二月 · 29 日</span></div>
+<section class="panel" id="cross-review">
+  <div class="panel-head">
+    <h2 class="panel-title">跨站复核</h2>
+    <span class="panel-sub mono">
+      {% if review_state.archived %}
+      结论已归档 · {{ review_state.active_review_id }}
+      {% else %}
+      <span class="badge badge-plain">未归档 · 草稿</span>
+      {% endif %}
+      · 规则 {{ review.rule_version }}
+    </span>
+  </div>
+  <div class="panel-note">
+    只比较两站<strong>共同实测日</strong>上的雨量：零雨（0.0 mm）算实测，缺测日两边都不计入。
+    不用整月合计直接相减，邻站暴雨日缺测不会被误报成雨量异常；两站某月没有共同实测日时标
+    <span class="badge badge-plain">证据不足</span>，不给差异结论。判为
+    <span class="badge badge-ok">一致</span>：差 ≤ {{ review.abs_tolerance_mm }} mm 或相对差 ≤ {{ review.rel_tolerance_pct }}%；
+    两项都超则 <span class="badge badge-bad">提示巡查</span>。
+  </div>
   <div class="table-wrap"><table class="table table-dense">
-    <thead><tr><th>行</th><th>站号</th><th>月份</th><th class="num">雨量</th><th class="num">实有日</th><th class="num">缺日</th><th>状态</th></tr></thead>
-    <tbody>{% for row in hydro_months %}<tr><td class="mono">{{ loop.index }}</td><td class="mono">{{ row.station }}</td><td class="mono">{{ row.month }}</td><td class="num mono">{{ row.rainfall_mm }} mm</td><td class="num mono">{{ row.days }}</td><td class="num mono">{{ row.missing_days }}</td><td><span class="badge {% if row.state == 'complete' %}badge-ok{% else %}badge-warn{% endif %}">{{ row.state }}</span></td></tr>{% endfor %}</tbody>
+    <thead>
+      <tr><th>行</th><th>站 A</th><th>站 B</th><th>月份</th><th class="num">共同实测日</th>
+        <th class="num">A 共同日雨量</th><th class="num">B 共同日雨量</th>
+        <th class="num">差 mm</th><th class="num">相对差 %</th><th>结论</th><th>说明</th><th>依据</th></tr>
+    </thead>
+    <tbody>
+      {% for row in review.pairs %}
+      <tr data-station-a="{{ row.station_a }}" data-station-b="{{ row.station_b }}" data-month="{{ row.month }}">
+        <td class="mono">{{ loop.index }}</td>
+        <td class="mono">{{ row.station_a }}</td>
+        <td class="mono">{{ row.station_b }}</td>
+        <td class="mono">{{ row.month }}</td>
+        <td class="num mono">{{ row.common_days }}</td>
+        <td class="num mono">{% if row.status == 'insufficient' %}—{% else %}{{ row.rainfall_a }}{% endif %}</td>
+        <td class="num mono">{% if row.status == 'insufficient' %}—{% else %}{{ row.rainfall_b }}{% endif %}</td>
+        <td class="num mono">{% if row.diff %}{{ row.diff }}{% else %}—{% endif %}</td>
+        <td class="num mono">{% if row.relative %}{{ row.relative }}{% else %}—{% endif %}</td>
+        <td>
+          {% if row.status == 'consistent' %}<span class="badge badge-ok">一致</span>
+          {% elif row.status == 'divergent' %}<span class="badge badge-bad">提示巡查</span>
+          {% else %}<span class="badge badge-plain">证据不足</span>{% endif %}
+        </td>
+        <td class="cell-note">{{ row.reason }}</td>
+        <td>
+          {% if row.evidence %}
+          <details class="evidence">
+            <summary class="link">{{ row.evidence|length }} 日</summary>
+            <ol class="evidence-list mono">
+              {% for item in row.evidence %}
+              <li>{{ item.date }} · A {{ item.rainfall_a }} / B {{ item.rainfall_b }} mm</li>
+              {% endfor %}
+            </ol>
+          </details>
+          {% else %}<span class="cell-note">无共同实测日</span>{% endif %}
+        </td>
+      </tr>
+      {% else %}
+      <tr><td colspan="12" class="cell-note">没有可比较的站点对。</td></tr>
+      {% endfor %}
+    </tbody>
   </table></div>
 </section>
 
 <section class="panel">
-  <div class="panel-head"><h2 class="panel-title">日值版本</h2><span class="panel-sub mono">零雨保留 · 高版本优先</span></div>
+  <div class="panel-head"><h2 class="panel-title">复核结论轨迹</h2><span class="panel-sub mono">同源重跑不新增 · 源变则失效</span></div>
+  <div class="table-wrap"><table class="table table-dense">
+    <thead><tr><th>结论号</th><th>状态</th><th>源摘要</th><th>生成</th><th>失效</th><th>失效于</th><th class="num">一致/差异/证据不足</th></tr></thead>
+    <tbody>
+      {% for item in review_history %}
+      <tr>
+        <td class="mono">{{ item.review_id }}</td>
+        <td>{% if item.status == 'active' %}<span class="badge badge-ok">生效</span>{% else %}<span class="badge badge-warn">已失效</span>{% endif %}</td>
+        <td class="mono cell-raw" title="{{ item.source_digest }}">{{ item.source_digest[:12] }}</td>
+        <td class="mono">{{ item.created_at }}</td>
+        <td class="mono">{{ item.invalidated_at or '—' }}</td>
+        <td class="mono">{{ item.invalidated_by or '—' }}</td>
+        <td class="num mono">{{ item.payload.summary.consistent or 0 }} / {{ item.payload.summary.divergent or 0 }} / {{ item.payload.summary.insufficient or 0 }}</td>
+      </tr>
+      {% else %}
+      <tr><td colspan="7" class="cell-note">还没有归档的复核结论。</td></tr>
+      {% endfor %}
+    </tbody>
+  </table></div>
+</section>
+
+{% if not batch %}
+<section class="empty"><p class="empty-line">电表批次尚未运行；以上跨站复核按日值源独立计算。</p></section>
+{% else %}
+
+<section class="panel">
+  <div class="panel-head"><h2 class="panel-title">站点月报</h2><span class="panel-sub mono">当地自然日 · 零雨算实测</span></div>
+  <div class="table-wrap"><table class="table table-dense">
+    <thead><tr><th>行</th><th>站号</th><th>月份</th><th class="num">雨量</th><th class="num">实有日</th><th class="num">缺日</th><th>状态</th></tr></thead>
+    <tbody>{% for row in hydro_months %}<tr><td class="mono">{{ loop.index }}</td><td class="mono">{{ row.station }}</td><td class="mono">{{ row.month }}</td><td class="num mono">{{ row.rainfall_mm }} mm</td><td class="num mono">{{ row.days }}</td><td class="num mono">{{ row.missing_days }}</td><td><span class="badge {% if row.state == 'complete' %}badge-ok{% else %}badge-warn{% endif %}">{{ row.state_label }}</span></td></tr>{% endfor %}</tbody>
+  </table></div>
+</section>
+
+<section class="panel">
+  <div class="panel-head"><h2 class="panel-title">日值版本</h2><span class="panel-sub mono">零雨保留 · 高版本优先 · 同版本冲突隔离</span></div>
   <div class="table-wrap"><table class="table table-dense">
     <thead><tr><th>站号</th><th>日期</th><th class="num">雨量</th><th class="num">版本</th><th>判定</th></tr></thead>
-    <tbody>{% for row in hydro_selected.selected %}<tr><td class="mono">{{ row.station }}</td><td class="mono">{{ row.date }}</td><td class="num mono">{{ row.rainfall_mm }} mm</td><td class="num mono">{{ row.version }}</td><td><span class="badge badge-ok">采纳</span></td></tr>{% endfor %}{% for row in hydro_selected.duplicates %}<tr><td class="mono">{{ row.station }}</td><td class="mono">{{ row.date }}</td><td class="num mono">{{ row.rainfall_mm }} mm</td><td class="num mono">{{ row.version }}</td><td><span class="badge badge-warn">低版本</span></td></tr>{% endfor %}</tbody>
+    <tbody>{% for row in hydro_selected.selected %}<tr><td class="mono">{{ row.station }}</td><td class="mono">{{ row.date }}</td><td class="num mono">{{ row.rainfall_mm }} mm</td><td class="num mono">{{ row.version }}</td><td><span class="badge badge-ok">采纳</span></td></tr>{% endfor %}{% for row in hydro_selected.duplicates %}<tr><td class="mono">{{ row.station }}</td><td class="mono">{{ row.date }}</td><td class="num mono">{{ row.rainfall_mm }} mm</td><td class="num mono">{{ row.version }}</td><td><span class="badge badge-warn">低版本</span></td></tr>{% endfor %}{% for row in hydro_selected.conflicts %}<tr><td class="mono">{{ row.station }}</td><td class="mono">{{ row.date }}</td><td class="num mono">—</td><td class="num mono">—</td><td><span class="badge badge-bad">同版本冲突 · 隔离</span></td></tr>{% endfor %}</tbody>
   </table></div>
 </section>
 {% endif %}
+{% endblock %}
+{% block scripts %}
+<script src="/static/review.js" type="module"></script>
 {% endblock %}

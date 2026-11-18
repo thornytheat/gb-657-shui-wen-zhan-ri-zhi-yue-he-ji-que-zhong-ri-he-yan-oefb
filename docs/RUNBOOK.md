@@ -19,7 +19,10 @@ curl -sS http://localhost:18216/api/health
 3. 读数诊断页看逐行诊断与隔离区，点「隔离区 CSV」下载证据。
 4. 区间还原页看翻转、换表末段、新表首读与标记，可点「重算区间」。
 5. 月度分摊页看每月合计、账单与尾差，可点「重算分摊」。
-6. 批次对账页看四账与运行清单；导出页下载五份文件。
+6. 月合计页的「跨站复核」表给巡查线索：每对站点只比较共同实测日（零雨算实测），
+   无共同实测日标「证据不足」；点「依据」展开逐日两站雨量。日值源
+   `sample_data/station_daily.csv` 更新后，旧结论自动失效并按新数据重算。
+7. 批次对账页看四账与运行清单；导出页下载五份文件。
 
 命令行同一套接口：
 
@@ -38,6 +41,10 @@ curl -sS -o /tmp/monthly.csv http://localhost:18216/api/export/monthly.csv
 - **换样例**：下拉框里其余样例分别是干净、GBK 中文表头、末行截断、空文件、仅表头、全空行、表头缺列。
 - **重跑测试**：`docker compose exec -T app python -m pytest -q`。
 - **清库**：`docker compose down -v` 删除命名卷；下次启动自动建表。
+- **跨站复核**：`GET /months` 展示当前生效结论；`POST /api/cross-review`（空 body 重读样例，
+  或带 `records` 提交）归档并重算；`GET /api/cross-review` 只读当前结论；
+  `GET /api/cross-review/history` 看失效/重算轨迹；`GET /api/cross-review/evidence?station_a=…&station_b=…`
+  按两站抽查共同实测日。
 
 ## 4 失败排查
 

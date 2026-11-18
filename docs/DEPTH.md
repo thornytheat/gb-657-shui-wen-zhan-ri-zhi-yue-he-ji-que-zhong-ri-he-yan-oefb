@@ -1,6 +1,6 @@
 # 深度登记 hydrocalendar（水文站日值月合计缺重日核验）
 
-- 规模：中型（7 个功能模块 / 6 个应用页 / 77 条测试）
+- 规模：中型（7 个功能模块 / 6 个应用页 / 108 条测试）
 - 核心规则：站点日值按版本选择而非后写覆盖，零雨与缺测分开；月合计用 Decimal，并以当地自然日日历核对完整度。
 - 使用者与工作流：流域数据员复核多站逐日雨量、缺重日、月合计与相邻站异常。
 
@@ -12,7 +12,7 @@
 | M2 表计契约 | 看容量、倍率、寄存器、单位与电价，试跑一行解析 | GET /api/contract、POST /api/contract/preview | `app/modules/m2_contract/contract.py` `app/modules/m2_contract/coerce.py` `app/modules/m2_contract/units.py` | `tests/test_m2_contract.py` |
 | M3 质量隔离 | 看原因码分布与隔离行，导出隔离区 CSV | GET /api/quarantine、GET /api/quarantine.csv | `app/modules/m3_quality/rules.py` `app/modules/m3_quality/quarantine.py` | `tests/test_m3_quality.py` |
 | M4 区间还原 | 重算区间，看翻转、换表、估抄标记 | POST /api/intervals/rebuild、页面 /intervals | `app/modules/m4_intervals/restore.py` `app/modules/m4_intervals/rollover.py` `app/modules/m4_intervals/swaps.py` | `tests/test_m4_intervals.py` |
-| M5 月量计算 | 按版本选择日值并计算月合计与缺日 | POST /api/hydro/monthly、页面 /months | `app/modules/m5_months/hydro.py` `app/modules/m5_months/allocate.py` `app/modules/m5_months/weights.py` | `tests/test_m5_months.py` `tests/test_hydro_rules.py` |
+| M5 月量计算 | 按版本选择日值并计算月合计与缺日；给出跨站复核结论与共同实测日 | POST /api/hydro/monthly、POST /api/cross-review、页面 /months | `app/modules/m5_months/hydro.py` `app/modules/m5_months/cross_review.py` `app/modules/m5_months/review_service.py` `app/modules/m5_months/allocate.py` `app/modules/m5_months/weights.py` | `tests/test_m5_months.py` `tests/test_hydro_rules.py` `tests/test_cross_review.py` |
 | M6 批次与对账 | 跑全流程、查批次历史、看四账、失败重试 | POST /api/runs、GET /api/batches、GET /api/reconcile、页面 /batches | `app/modules/m6_batches/service.py` `app/modules/m6_batches/compare.py` `app/modules/m6_batches/history.py` `app/modules/m6_batches/resume.py` | `tests/test_m6_batches.py` |
 | M7 导出 | 导出单一月报与运行证据 | GET /api/export/monthly.csv、页面 /report | `app/modules/m7_export/evidence.py` `app/modules/m7_export/csv_out.py` `app/modules/m7_export/manifest_out.py` | `tests/test_m7_export.py` |
 
@@ -38,6 +38,8 @@
 | TRAP-18 | 0 字节文件、只有表头、数据行全是空行 | 三种都返回「成功导入 0 行」，或直接除零 | 三个文件级原因码分开返回，不落半批数据 | `app/modules/m1_ingest/service.py` | `tests/test_m1_ingest.py::test_empty_states_return_distinct_codes` |
 | TRAP-23 | 区间止点与下一段起点都算一次 | 相邻区间重复计入一天，月度用量偏高 | 区间与月桶都声明左闭右开 `[起, 止)`，相邻段首尾相接 | `app/modules/m5_months/weights.py`、`app/modules/m4_intervals/restore.py` | `tests/test_m5_months.py::test_month_slices_are_half_open`、`tests/test_m4_intervals.py::test_intervals_are_half_open_and_contiguous` |
 | TRAP-24 | 各月/各分量各自四舍五入后合计不等 | 分完差 0.001~0.02，账永远差几分 | 最大余额法分月；分量残差并入最大分量；账单先合计再舍入，分项补差 | `app/modules/m5_months/weights.py`、`app/modules/m5_months/tou.py` | `tests/test_m5_months.py::test_largest_remainder_keeps_total_exact`、`tests/test_m5_months.py::test_tou_components_closed_to_total` |
+| TRAP-25 | 邻站在暴雨日缺测，直接比月雨量 | 缺测被当成少雨，整月差几十毫米，误报巡查或等整月补齐才敢报 | 只比较两站共同实测日，缺测日两边都不计入；无共同实测日标「证据不足」；零雨算实测 | `app/modules/m5_months/cross_review.py` | `tests/test_cross_review.py::test_common_days_only_shared_measured_dates`、`tests/test_cross_review.py::test_no_common_measured_day_reports_insufficient` |
+| TRAP-26 | 日值源更新后仍沿用旧复核结论，或同批重跑重复追加复核记录 | 汛期巡查拿到过期线索，或轨迹无限增长 | 结论按源摘要归档：同摘要命中不新增，摘要变化置旧结论 `invalidated` 并重算 | `app/modules/m5_months/review_service.py`、`app/store.py` | `tests/test_cross_review.py::test_same_source_rerun_does_not_add_records`、`tests/test_cross_review.py::test_source_update_invalidates_and_recomputes` |
 
 ## 对账规则
 
@@ -51,6 +53,7 @@
 - 反例（朴素实现会挂）：`tests/test_m4_intervals.py::test_naive_subtraction_would_drop_rollover`（直接相减得负数，翻转段被丢）、`tests/test_m5_months.py::test_bill_rounding_closed_not_naive`（逐项四舍五入多 1 分）、`tests/test_m1_ingest.py::test_naive_splitlines_would_break_records`（带千分位的单元格被切成两列）。
 - 不变量：`tests/test_invariants.py::test_conservation_intervals_equal_months`（守恒）、`tests/test_invariants.py::test_idempotent_run_keeps_rows`（幂等）、`tests/test_invariants.py::test_month_slices_partition_every_interval`（划分）、`tests/test_invariants.py::test_bill_components_sum_equals_amount`（账单闭合）、`tests/test_invariants.py::test_readings_partition_holds`（分区）。
 - 端到端：`tests/test_e2e.py::test_full_pipeline_over_http`。
+- 跨站复核：`tests/test_cross_review.py`（零雨算实测、缺测不计、共同实测日、证据不足、源更新失效重算、同源幂等）。
 
 ## 已知不覆盖
 

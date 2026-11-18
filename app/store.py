@@ -74,6 +74,28 @@ CREATE TABLE IF NOT EXISTS totals (
 CREATE TABLE IF NOT EXISTS manifests (
     batch_id TEXT PRIMARY KEY, json TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS cross_reviews (
+    review_id TEXT PRIMARY KEY,
+    scope TEXT NOT NULL,
+    source_digest TEXT NOT NULL,
+    rule_version TEXT NOT NULL,
+    status TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    invalidated_at TEXT,
+    invalidated_by TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_cross_reviews_source
+    ON cross_reviews(scope, source_digest);
+CREATE INDEX IF NOT EXISTS idx_cross_reviews_active
+    ON cross_reviews(scope, status);
+CREATE TABLE IF NOT EXISTS daily_sources (
+    scope TEXT PRIMARY KEY,
+    source_digest TEXT NOT NULL,
+    origin TEXT NOT NULL DEFAULT 'file',
+    records_json TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
 """
 
 
@@ -91,6 +113,11 @@ class Store:
                        conn.execute("PRAGMA table_info(batches)").fetchall()}
             if "updated_at" not in columns:
                 conn.execute("ALTER TABLE batches ADD COLUMN updated_at TEXT")
+            source_columns = {row["name"] for row in
+                              conn.execute("PRAGMA table_info(daily_sources)").fetchall()}
+            if source_columns and "origin" not in source_columns:
+                conn.execute("ALTER TABLE daily_sources ADD COLUMN "
+                             "origin TEXT NOT NULL DEFAULT 'file'")
 
     @contextmanager
     def connect(self):
@@ -340,6 +367,143 @@ class Store:
             row = conn.execute("SELECT json FROM manifests WHERE batch_id=?",
                                (batch_id,)).fetchone()
         return json.loads(row["json"]) if row else None
+
+    # ---------- 跨站复核（按日值源摘要归档） ----------
+    def record_cross_review(self, *, review_id: str, scope: str,
+                            source_digest: str, rule_version: str,
+                            status: str, payload: dict,
+                            created_at: str) -> dict:
+        """同一 (scope, 摘要) 只落一条；摘要变化时把该 scope 的旧结论标失效。
+
+        返回 {record, created, invalidated_ids}：created=False 表示命中已有结论，
+        行数不变（同一批日值重跑不新增复核记录）。
+        """
+        with self.connect() as conn:
+            existing = conn.execute(
+                "SELECT * FROM cross_reviews WHERE scope=? AND source_digest=?",
+                (scope, source_digest)).fetchone()
+            if existing is not None:
+                if existing["status"] == "active":
+                    return {"record": self._review_row(existing), "created": False,
+                            "invalidated_ids": []}
+                # 日值源改回旧摘要：复用原记录重新生效，不新增第二条同源记录
+                stale = conn.execute(
+                    "SELECT review_id FROM cross_reviews "
+                    "WHERE scope=? AND status='active' AND source_digest<>?",
+                    (scope, source_digest)).fetchall()
+                stale_ids = [row["review_id"] for row in stale]
+                conn.execute(
+                    "UPDATE cross_reviews SET status='invalidated', invalidated_at=?, "
+                    "invalidated_by=? WHERE scope=? AND status='active' "
+                    "AND source_digest<>?",
+                    (created_at, review_id, scope, source_digest))
+                conn.execute(
+                    "UPDATE cross_reviews SET status='active', invalidated_at=NULL, "
+                    "invalidated_by=NULL, created_at=? WHERE review_id=?",
+                    (created_at, existing["review_id"]))
+                row = conn.execute(
+                    "SELECT * FROM cross_reviews WHERE review_id=?",
+                    (existing["review_id"],)).fetchone()
+                return {"record": self._review_row(row), "created": False,
+                        "reactivated": True, "invalidated_ids": stale_ids}
+            stale = conn.execute(
+                "SELECT review_id FROM cross_reviews "
+                "WHERE scope=? AND status='active' AND source_digest<>?",
+                (scope, source_digest)).fetchall()
+            stale_ids = [row["review_id"] for row in stale]
+            conn.execute(
+                "UPDATE cross_reviews SET status='invalidated', invalidated_at=?, "
+                "invalidated_by=? WHERE scope=? AND status='active' "
+                "AND source_digest<>?",
+                (created_at, review_id, scope, source_digest))
+            cursor = conn.execute(
+                """INSERT INTO cross_reviews (review_id,scope,source_digest,
+                        rule_version,status,payload_json,created_at)
+                   VALUES (?,?,?,?,?,?,?)
+                   ON CONFLICT(scope,source_digest) DO NOTHING""",
+                (review_id, scope, source_digest, rule_version, "active",
+                 json.dumps(payload, ensure_ascii=False), created_at))
+            row = conn.execute(
+                "SELECT * FROM cross_reviews WHERE scope=? AND source_digest=?",
+                (scope, source_digest)).fetchone()
+        return {"record": self._review_row(row),
+                "created": cursor.rowcount == 1,
+                "invalidated_ids": stale_ids if cursor.rowcount == 1 else []}
+
+    def latest_cross_review(self, scope: str) -> dict | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM cross_reviews WHERE scope=? AND status='active' "
+                "ORDER BY created_at DESC, rowid DESC LIMIT 1", (scope,)).fetchone()
+        return self._review_row(row) if row else None
+
+    def list_cross_reviews(self, scope: str, limit: int = 50) -> list[dict]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM cross_reviews WHERE scope=? "
+                "ORDER BY created_at DESC, rowid DESC LIMIT ?",
+                (scope, limit)).fetchall()
+        return [self._review_row(row) for row in rows]
+
+    def count_cross_reviews(self, scope: str) -> int:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS n FROM cross_reviews WHERE scope=?",
+                (scope,)).fetchone()
+        return row["n"]
+
+    # ---------- 日值源（复核的输入快照） ----------
+    def save_daily_source(self, *, scope: str, source_digest: str,
+                          records: list[dict], updated_at: str,
+                          origin: str = "records") -> bool:
+        """保存一批日值；摘要与来源都没变时不改动。返回是否发生了更新。"""
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT source_digest, origin FROM daily_sources WHERE scope=?",
+                (scope,)).fetchone()
+            if (row is not None and row["source_digest"] == source_digest
+                    and row["origin"] == origin):
+                return False
+            conn.execute(
+                """INSERT INTO daily_sources
+                     (scope,source_digest,origin,records_json,updated_at)
+                   VALUES (?,?,?,?,?)
+                   ON CONFLICT(scope) DO UPDATE SET
+                     source_digest=excluded.source_digest,
+                     origin=excluded.origin,
+                     records_json=excluded.records_json,
+                     updated_at=excluded.updated_at""",
+                (scope, source_digest, origin,
+                 json.dumps(records, ensure_ascii=False), updated_at))
+        return True
+
+    def peek_daily_source(self, scope: str) -> dict | None:
+        """只读快照元信息，不加载整批记录。"""
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT scope, source_digest, origin, updated_at "
+                "FROM daily_sources WHERE scope=?", (scope,)).fetchone()
+        return dict(row) if row else None
+
+    def load_daily_source(self, scope: str) -> dict | None:
+        with self.connect() as conn:
+            row = conn.execute("SELECT * FROM daily_sources WHERE scope=?",
+                               (scope,)).fetchone()
+        if row is None:
+            return None
+        item = dict(row)
+        item["records"] = json.loads(item.pop("records_json") or "[]")
+        return item
+
+    def delete_daily_source(self, scope: str) -> None:
+        with self.connect() as conn:
+            conn.execute("DELETE FROM daily_sources WHERE scope=?", (scope,))
+
+    @staticmethod
+    def _review_row(row) -> dict:
+        item = dict(row)
+        item["payload"] = json.loads(item.pop("payload_json") or "{}")
+        return item
 
     def count_rows(self, batch_id: str) -> dict:
         tables = ("meters", "readings", "intervals", "allocations", "bills", "quarantine")
